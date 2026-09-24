@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Policy engine tests
+        run: cargo test -p obelisk-policy
+      - name: Vectors up to date
+        run: |
+          cargo run -q -p obelisk-policy --example vectors > /dev/null
+          git diff --exit-code fixtures/vectors.json

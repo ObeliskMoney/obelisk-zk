@@ -1,0 +1,8 @@
+[workspace]
+members = ["lib", "program", "script"]
+resolver = "2"
+
+[workspace.dependencies]
+alloy-sol-types = "1"
+alloy-primitives = { version = "1", default-features = false, features = ["serde"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
