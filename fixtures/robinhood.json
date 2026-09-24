@@ -1,6 +1,7 @@
 {
   "chainId": 4663,
-  "factory": "0x4530A51f8efB1A3Fc3d57e14db1965A1038Bb15c",
+  "factory": "0x1dBA1119DB33533fc10966E5f0806290Eae435Cd",
+  "vaultVersion": 4,
   "mockAssets": false,
   "policy": {
     "allowedRecipients": [],
@@ -35,6 +36,7 @@
   "verifierKind": "sp1-groth16",
   "weth": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
   "legacyFactories": [
+    "0x4530A51f8efB1A3Fc3d57e14db1965A1038Bb15c",
     "0xadDe5A5cF722Ef1e6a55fB15d84Fd4A9a71a2429"
   ],
   "notes": "vault, vaultProgramVKey, policy and policyHash describe the first mainnet vault, made by the earlier factory (legacyFactories[0]) with policy v2. New vaults come from factory and use programVKey (policy v3), the ELF in zk/elf built at ObeliskMoney/Obelisk commit d9ee995 (obelisk-zk 9c20e28); the v2 key is the ELF at Obelisk commit d4d3b6d."
