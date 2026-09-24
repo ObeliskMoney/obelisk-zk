@@ -4,7 +4,7 @@
 //! - inside the SP1 program (guest), to produce the proof;
 //! - on the host (native), for a fast pre-check and clear refusal codes.
 
-use alloy_primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
+use alloy_primitives::{aliases::U24, keccak256, Address, Bytes, FixedBytes, B256, U256, U512};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +36,11 @@ sol! {
 }
 
 /// v2: adds `allowedTokensOut` and requires `amountOutMinimum > 0` for swaps.
-pub const POLICY_VERSION: u8 = 2;
+/// v3: adds `allowedFees` (pins the swap pool) and `minOutPerIn` (an owner-set price floor per output token).
+pub const POLICY_VERSION: u8 = 3;
+
+/// `minOutPerIn` is the minimum `amountOut` per unit of `amountIn`, scaled by 1e18.
+pub const PRICE_SCALE: u64 = 1_000_000_000_000_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +57,13 @@ pub struct Policy {
     /// Tokens a swap may output (v2).
     #[serde(default)]
     pub allowed_tokens_out: Vec<Address>,
+    /// Uniswap fee tiers a swap may use, which pins the pool (v3). Each must fit in uint24.
+    #[serde(default)]
+    pub allowed_fees: Vec<u32>,
+    /// Price floor for `allowed_tokens_out[i]`: minimum amountOut per unit of amountIn, times 1e18 (v3).
+    /// Same length as `allowed_tokens_out`, every entry above zero.
+    #[serde(default)]
+    pub min_out_per_in: Vec<U256>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +92,7 @@ pub struct ProverInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Violation {
     UnsupportedVersion(u8),
+    BadPolicy,
     ValueNotZero,
     SelfCall,
     CalldataTooShort,
@@ -95,6 +107,8 @@ pub enum Violation {
     SwapRecipientNotVault(Address),
     TokenOutNotAllowed(Address),
     NoMinOut,
+    FeeNotAllowed(u32),
+    MinOutBelowFloor { min_out: U256, required: U256 },
     UnlimitedApprove(U256),
     ExceedsPerTx { spend: U256, max: U256 },
     ExceedsPerDay { after: U256, max: U256 },
@@ -105,6 +119,7 @@ impl Violation {
     pub fn code(&self) -> &'static str {
         match self {
             Self::UnsupportedVersion(_) => "UNSUPPORTED_VERSION",
+            Self::BadPolicy => "BAD_POLICY",
             Self::ValueNotZero => "VALUE_NOT_ZERO",
             Self::SelfCall => "SELF_CALL",
             Self::CalldataTooShort => "CALLDATA_TOO_SHORT",
@@ -119,6 +134,8 @@ impl Violation {
             Self::SwapRecipientNotVault(_) => "SWAP_RECIPIENT_NOT_VAULT",
             Self::TokenOutNotAllowed(_) => "TOKEN_OUT_NOT_ALLOWED",
             Self::NoMinOut => "NO_MIN_OUT",
+            Self::FeeNotAllowed(_) => "FEE_NOT_ALLOWED",
+            Self::MinOutBelowFloor { .. } => "MIN_OUT_BELOW_FLOOR",
             Self::UnlimitedApprove(_) => "UNLIMITED_APPROVE",
             Self::ExceedsPerTx { .. } => "EXCEEDS_PER_TX",
             Self::ExceedsPerDay { .. } => "EXCEEDS_PER_DAY",
@@ -130,6 +147,7 @@ impl core::fmt::Display for Violation { // Frozen: these messages are compiled i
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::UnsupportedVersion(v) => write!(f, "versi policy {v} tidak didukung"),
+            Self::BadPolicy => write!(f, "policy tidak valid"),
             Self::ValueNotZero => write!(f, "pengiriman ETH tidak diizinkan"),
             Self::SelfCall => write!(f, "intent tidak boleh memanggil vault sendiri"),
             Self::CalldataTooShort => write!(f, "calldata terlalu pendek"),
@@ -146,6 +164,10 @@ impl core::fmt::Display for Violation { // Frozen: these messages are compiled i
             Self::SwapRecipientNotVault(a) => write!(f, "hasil swap dikirim ke {a}, bukan ke vault"),
             Self::TokenOutNotAllowed(a) => write!(f, "swap ke token {a} tidak di whitelist"),
             Self::NoMinOut => write!(f, "swap tanpa batas slippage (amountOutMinimum = 0)"),
+            Self::FeeNotAllowed(x) => write!(f, "fee pool {x} tidak di whitelist"),
+            Self::MinOutBelowFloor { min_out, required } => {
+                write!(f, "amountOutMinimum {min_out} di bawah batas harga {required}")
+            }
             Self::UnlimitedApprove(x) => write!(f, "approve {x} melebihi batas"),
             Self::ExceedsPerTx { spend, max } => {
                 write!(f, "nominal {spend} melebihi batas per transaksi {max}")
@@ -172,9 +194,26 @@ impl Policy {
                 self.allowed_selectors.clone(),
                 self.deny_unlimited_approve,
                 self.allowed_tokens_out.clone(),
+                // Encoded as uint24[]; `check` refuses a policy with a fee above uint24.
+                self.allowed_fees.iter().map(|f| U24::saturating_from(*f)).collect::<Vec<_>>(),
+                self.min_out_per_in.clone(),
             )
                 .abi_encode_params(),
         )
+    }
+}
+
+impl Policy {
+    /// v3 shape rules: fees fit in uint24, one non-zero price floor per output token.
+    fn validate(&self) -> Result<(), Violation> {
+        let fees_ok = self.allowed_fees.iter().all(|f| *f <= 0xFF_FFFF);
+        let floors_ok = self.min_out_per_in.len() == self.allowed_tokens_out.len()
+            && self.min_out_per_in.iter().all(|x| !x.is_zero());
+        if fees_ok && floors_ok {
+            Ok(())
+        } else {
+            Err(Violation::BadPolicy)
+        }
     }
 }
 
@@ -256,11 +295,25 @@ fn spend_of(input: &ProverInput) -> Result<U256, Violation> {
             if c.recipient != input.vault {
                 return Err(Violation::SwapRecipientNotVault(c.recipient));
             }
-            if !p.allowed_tokens_out.contains(&c.tokenOut) {
-                return Err(Violation::TokenOutNotAllowed(c.tokenOut));
+            let fee = c.fee.to::<u32>();
+            if !p.allowed_fees.contains(&fee) {
+                return Err(Violation::FeeNotAllowed(fee));
             }
+            let Some(k) = p.allowed_tokens_out.iter().position(|t| *t == c.tokenOut) else {
+                return Err(Violation::TokenOutNotAllowed(c.tokenOut));
+            };
             if c.amountOutMinimum.is_zero() {
                 return Err(Violation::NoMinOut);
+            }
+            // amountOutMinimum * 1e18 >= amountIn * minOutPerIn, in 512 bits so nothing overflows.
+            let scale = U512::from(PRICE_SCALE);
+            let need = U512::from(c.amountIn) * U512::from(p.min_out_per_in[k]);
+            if U512::from(c.amountOutMinimum) * scale < need {
+                let required = need.div_ceil(scale);
+                return Err(Violation::MinOutBelowFloor {
+                    min_out: c.amountOutMinimum,
+                    required: U256::saturating_from(required),
+                });
             }
             Ok(c.amountIn)
         }
@@ -276,6 +329,7 @@ pub fn check(input: &ProverInput) -> Result<PolicyOutput, Violation> {
     if p.version != POLICY_VERSION {
         return Err(Violation::UnsupportedVersion(p.version));
     }
+    p.validate()?;
     if !i.value.is_zero() {
         return Err(Violation::ValueNotZero);
     }

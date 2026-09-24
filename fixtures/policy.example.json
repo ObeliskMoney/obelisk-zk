@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "token": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
   "maxPerTx": "100000000",
   "maxPerDay": "300000000",
@@ -7,5 +7,7 @@
   "allowedRecipients": [],
   "allowedSelectors": ["0x095ea7b3", "0x04e45aaf"],
   "denyUnlimitedApprove": true,
-  "allowedTokensOut": ["0x4200000000000000000000000000000000000006"]
+  "allowedTokensOut": ["0x4200000000000000000000000000000000000006"],
+  "allowedFees": [500],
+  "minOutPerIn": ["100000000000000000000000000"]
 }

@@ -8,6 +8,13 @@ const VAULT: Address = address!("00000000000000000000000000000000000000Aa");
 const ATTACKER: Address = address!("00000000000000000000000000000000000BAD00");
 const FRIEND: Address = address!("0000000000000000000000000000000000F00D00");
 const UNIT: u64 = 1_000_000;
+/// Test price floor: at least 1e8 wei of WETH per USDC unit (ETH at most $10,000), times 1e18.
+const FLOOR_WEI_PER_UNIT: u64 = 100_000_000;
+const FEE: u32 = 500;
+
+fn floor() -> U256 {
+    U256::from(FLOOR_WEI_PER_UNIT) * U256::from(PRICE_SCALE)
+}
 
 fn usdc(n: u64) -> U256 {
     U256::from(n * UNIT)
@@ -15,7 +22,7 @@ fn usdc(n: u64) -> U256 {
 
 fn policy() -> Policy {
     Policy {
-        version: 2,
+        version: 3,
         token: USDC,
         max_per_tx: usdc(100),
         max_per_day: usdc(300),
@@ -28,6 +35,8 @@ fn policy() -> Policy {
         ],
         deny_unlimited_approve: true,
         allowed_tokens_out: vec![WETH],
+        allowed_fees: vec![FEE],
+        min_out_per_in: vec![floor()],
     }
 }
 
@@ -36,14 +45,18 @@ fn intent(target: Address, data: Vec<u8>) -> Intent {
 }
 
 fn swap(amount_in: U256, token_in: Address, recipient: Address) -> Intent {
-    swap_to(amount_in, token_in, recipient, WETH, U256::from(1))
+    swap_to(amount_in, token_in, recipient, WETH, amount_in * U256::from(FLOOR_WEI_PER_UNIT))
 }
 
 fn swap_to(amount_in: U256, token_in: Address, recipient: Address, token_out: Address, min_out: U256) -> Intent {
+    swap_full(amount_in, token_in, recipient, token_out, min_out, FEE)
+}
+
+fn swap_full(amount_in: U256, token_in: Address, recipient: Address, token_out: Address, min_out: U256, fee: u32) -> Intent {
     let params = ExactInputSingleParams {
         tokenIn: token_in,
         tokenOut: token_out,
-        fee: alloy_primitives::aliases::U24::from(500),
+        fee: alloy_primitives::aliases::U24::from(fee),
         recipient,
         amountIn: amount_in,
         amountOutMinimum: min_out,
@@ -225,8 +238,8 @@ fn dirty_address_padding_rejected() {
 #[test]
 fn unsupported_version_rejected() {
     let mut i = input(swap(usdc(1), USDC, VAULT), U256::ZERO);
-    i.policy.version = 3;
-    assert_eq!(err(i), Violation::UnsupportedVersion(3));
+    i.policy.version = 4;
+    assert_eq!(err(i), Violation::UnsupportedVersion(4));
 }
 
 // ---------------------------------------------------------------- hashing
@@ -274,5 +287,103 @@ fn tokens_out_change_policy_hash() {
     let mut p = policy();
     let h = p.hash();
     p.allowed_tokens_out.push(USDC);
+    assert_ne!(h, p.hash());
+}
+
+// ---------------------------------------------------------------- policy v3 (self-audit F-11, review F-A)
+
+#[test]
+fn v2_policy_rejected() {
+    let mut i = input(swap(usdc(1), USDC, VAULT), U256::ZERO);
+    i.policy.version = 2;
+    assert_eq!(err(i), Violation::UnsupportedVersion(2));
+}
+
+#[test]
+fn swap_on_unlisted_fee_tier_rejected() {
+    for fee in [100u32, 3_000, 10_000] {
+        let i = swap_full(usdc(100), USDC, VAULT, WETH, usdc(100) * U256::from(FLOOR_WEI_PER_UNIT), fee);
+        assert_eq!(err(input(i, U256::ZERO)), Violation::FeeNotAllowed(fee));
+    }
+}
+
+#[test]
+fn swap_with_token_min_out_rejected() {
+    // v2 accepted amountOutMinimum = 1 wei for a 100 USDC swap.
+    let i = swap_to(usdc(100), USDC, VAULT, WETH, U256::from(1));
+    let required = usdc(100) * U256::from(FLOOR_WEI_PER_UNIT);
+    assert_eq!(err(input(i, U256::ZERO)), Violation::MinOutBelowFloor { min_out: U256::from(1), required });
+}
+
+#[test]
+fn swap_min_out_floor_boundary() {
+    let at = usdc(50) * U256::from(FLOOR_WEI_PER_UNIT);
+    assert!(check(&input(swap_to(usdc(50), USDC, VAULT, WETH, at), U256::ZERO)).is_ok());
+    let below = at - U256::from(1);
+    assert_eq!(
+        err(input(swap_to(usdc(50), USDC, VAULT, WETH, below), U256::ZERO)),
+        Violation::MinOutBelowFloor { min_out: below, required: at }
+    );
+}
+
+#[test]
+fn floor_rounds_required_amount_up() {
+    // A floor of 1.5 wei per unit: 3 units need at least 4.5, so 4 is refused and 5 passes.
+    let mut i = input(swap_to(U256::from(3), USDC, VAULT, WETH, U256::from(4)), U256::ZERO);
+    i.policy.min_out_per_in = vec![U256::from(PRICE_SCALE) * U256::from(3) / U256::from(2)];
+    assert_eq!(err(i.clone()), Violation::MinOutBelowFloor { min_out: U256::from(4), required: U256::from(5) });
+    i.intent = swap_to(U256::from(3), USDC, VAULT, WETH, U256::from(5));
+    assert!(check(&i).is_ok());
+}
+
+#[test]
+fn floor_is_per_output_token() {
+    let other = address!("0000000000000000000000000000000000000E75");
+    let mut i = input(swap_to(usdc(10), USDC, VAULT, other, usdc(10)), U256::ZERO);
+    i.policy.allowed_tokens_out.push(other);
+    i.policy.min_out_per_in.push(U256::from(2) * U256::from(PRICE_SCALE)); // 2 units out per unit in
+    assert_eq!(
+        err(i.clone()),
+        Violation::MinOutBelowFloor { min_out: usdc(10), required: usdc(20) }
+    );
+    i.intent = swap_to(usdc(10), USDC, VAULT, other, usdc(20));
+    assert!(check(&i).is_ok());
+}
+
+#[test]
+fn huge_amounts_refused_without_panic() {
+    let mut i = input(swap_to(U256::MAX, USDC, VAULT, WETH, U256::from(1)), U256::ZERO);
+    i.policy.max_per_tx = U256::MAX;
+    i.policy.max_per_day = U256::MAX;
+    i.policy.min_out_per_in = vec![U256::MAX];
+    assert_eq!(err(i), Violation::MinOutBelowFloor { min_out: U256::from(1), required: U256::MAX });
+}
+
+#[test]
+fn policy_without_price_floor_rejected() {
+    let data = approveCall { spender: ROUTER, amount: usdc(1) }.abi_encode();
+    let base = input(intent(USDC, data), U256::ZERO);
+
+    let mut i = base.clone();
+    i.policy.min_out_per_in = vec![U256::ZERO];
+    assert_eq!(err(i), Violation::BadPolicy);
+
+    let mut i = base.clone();
+    i.policy.min_out_per_in.clear();
+    assert_eq!(err(i), Violation::BadPolicy);
+
+    let mut i = base;
+    i.policy.allowed_fees.push(0x100_0000); // above uint24
+    assert_eq!(err(i), Violation::BadPolicy);
+}
+
+#[test]
+fn fees_and_floors_change_policy_hash() {
+    let h = policy().hash();
+    let mut p = policy();
+    p.allowed_fees = vec![100];
+    assert_ne!(h, p.hash());
+    let mut p = policy();
+    p.min_out_per_in = vec![floor() + U256::from(1)];
     assert_ne!(h, p.hash());
 }

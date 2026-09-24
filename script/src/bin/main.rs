@@ -52,6 +52,7 @@ fn english(v: &Violation) -> String {
     use Violation::*;
     match v {
         UnsupportedVersion(x) => format!("policy version {x} is not supported"),
+        BadPolicy => "the policy is malformed (fees must fit uint24, one non-zero price floor per output token)".into(),
         ValueNotZero => "sending ETH is not allowed".into(),
         SelfCall => "the intent may not call the vault itself".into(),
         CalldataTooShort => "calldata is too short".into(),
@@ -66,6 +67,10 @@ fn english(v: &Violation) -> String {
         SwapRecipientNotVault(a) => format!("swap output goes to {a}, not the vault"),
         TokenOutNotAllowed(a) => format!("swapping into token {a} is not allowed"),
         NoMinOut => "swap has no price protection (amountOutMinimum = 0)".into(),
+        FeeNotAllowed(x) => format!("swap fee tier {x} is not allowed"),
+        MinOutBelowFloor { min_out, required } => {
+            format!("amountOutMinimum {min_out} is below the policy price floor {required}")
+        }
         UnlimitedApprove(x) => format!("approval of {x} is above the limit"),
         ExceedsPerTx { spend, max } => format!("amount {spend} is above the per-transaction limit {max}"),
         ExceedsPerDay { after, max } => format!("daily total {after} is above the daily limit {max}"),
